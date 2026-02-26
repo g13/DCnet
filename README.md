@@ -4,24 +4,30 @@
 
 ```mermaid
 flowchart TD
-    A["Batch from dataloader<br/>cue, mixture, label"] --> B["Cue pass through recurrent EI stack<br/>num_steps x num_layers"]
-    B --> C["Store cue states<br/>outs_cue, h_pyrs_cue, h_inters_cue"]
-    C --> D["Mixture pass through same EI stack<br/>re-initialize hidden if flush_hidden=True"]
+    A["Input batch from dataloader<br/>tuple: cue, mixture, label<br/>`for i, (cue, mixture, labels) in train_loader`<br/>`train_new2.py` L70"] --> B["Call model forward<br/>`outputs = model(cue, mixture, ...)`<br/>`train_new2.py` L76"]
 
-    subgraph L[Per-step and per-layer computation]
-      E["input to layer i<br/>raw image for i=0; previous layer output otherwise"] --> F["Excitatory update<br/>conv_exc_* plus pre_inh_activation"]
-      F --> G["Interneuron branch<br/>conv_exc_inter then conv_inh"]
-      G --> H["Candidate state<br/>cnm_pyr = post_inh(exc - inh)"]
-      H --> I["Euler integration with learnable tau<br/>h_next = (1 - tau) * h + tau * cnm"]
-      I --> J["Average pooling output"]
-      J --> K["Optional cue-driven low-rank modulation<br/>outs = outs * (1 + rank1 * 0.1)"]
-      K --> M["Optional feedback to lower layers"]
+    B --> C["Enter `Conv2dEIRNN.forward(...)`<br/>`model.py` L727-L734"]
+    C --> D["Two-stage stimulation loop<br/>`for stimulation in (cue, mixture)`<br/>`model.py` L756"]
+
+    D --> E["Initialize hidden / fb / outputs for this stage<br/>`_init_hidden` L766-L768, `_init_fb` L770-L772, `_init_out` L775-L777<br/>`model.py`"]
+    E --> F["Time loop and layer loop<br/>`for t in range(self.num_steps)` L778<br/>`for i, layer in enumerate(self.layers)` L787<br/>`model.py`"]
+
+    subgraph L[Per-step and per-layer computation with exact calls]
+      F --> G["Compute one EI layer update<br/>`layer(...)` call in `Conv2dEIRNN.forward`<br/>`model.py` L806-L819"]
+      G --> H["Inside `Conv2dEIRNNCell.forward(...)`<br/>`model.py` L334-L397"]
+      H --> H1["Excitation path<br/>`conv_exc_pyr(torch.cat(...))` + pre_inh activation<br/>`model.py` L358-L363"]
+      H1 --> H2["Interneuron/inhibition path (if enabled)<br/>`conv_exc_inter(...)` L367-L372 then `conv_inh(...)` L374<br/>`model.py`"]
+      H2 --> H3["Candidate states<br/>`cnm_pyr = post_inh_activation(exc_pyr - inh_pyr)`<br/>`model.py` L379"]
+      H3 --> H4["Euler membrane update with learnable tau<br/>`tau_pyr = sigmoid(self.tau_pyr)` L385<br/>`h_next_pyr = (1-tau)*h + tau*cnm` L386<br/>`model.py`"]
+      H4 --> H5["Layer output pooling<br/>`out = self.out_pool(h_next_pyr)`<br/>`model.py` L395"]
+      H5 --> I["Optional cue-driven modulation on mixture stage<br/>condition + `self.modulations[i](out_cue, outs[t][i])`<br/>`model.py` L822-L843<br/>`LowRankModulation.forward` `model.py` L27-L45"]
+      I --> J["Optional feedback accumulation<br/>`fbs[t][j] += self.fb_convs[...] (outs[t][i])`<br/>`model.py` L845-L851"]
     end
 
-    D --> N["Take final top-layer output<br/>outs[-1][-1] or all steps"]
-    N --> O["Head: flatten plus FC plus dropout plus FC"]
-    O --> P["Class logits"]
-    P --> Q["argmax for metrics<br/>CrossEntropyLoss during training"]
+    J --> K["After cue stage: cache cue activations<br/>`outs_cue = outs`; `h_pyrs_cue = h_pyrs`<br/>`model.py` L865-L867"]
+    K --> M["Readout selection<br/>final step: `out = self.out_layer(outs[-1][-1])` L874<br/>or all timesteps at L869-L873<br/>`model.py`"]
+    M --> N["Classification head (`self.out_layer`)<br/>Flatten -> Linear -> ReLU -> Dropout -> Linear<br/>`model.py` L667-L677"]
+    N --> O["Training objective and metrics<br/>`loss = criterion(outputs, labels)` L84<br/>`predicted = outputs.argmax(-1)` L98<br/>`train_new2.py`"]
 ```
 
 ## Detailed training process (from `train_new2.py`)
