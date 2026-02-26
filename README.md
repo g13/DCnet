@@ -4,24 +4,24 @@
 
 ```mermaid
 flowchart TD
-    A[Batch from dataloader\ncue, mixture, label] --> B[Cue pass through recurrent EI stack\nnum_steps x num_layers]
-    B --> C[Store cue states\nouts_cue, h_pyrs_cue, h_inters_cue]
-    C --> D[Mixture pass through same EI stack\nre-initialize hidden if flush_hidden=True]
+    A["Batch from dataloader<br/>cue, mixture, label"] --> B["Cue pass through recurrent EI stack<br/>num_steps x num_layers"]
+    B --> C["Store cue states<br/>outs_cue, h_pyrs_cue, h_inters_cue"]
+    C --> D["Mixture pass through same EI stack<br/>re-initialize hidden if flush_hidden=True"]
 
-    subgraph L[Per-step, per-layer computation]
-      E[input to layer i\n(raw image for i=0, previous layer output otherwise)] --> F[Excitatory update\nconv_exc_* + pre_inh_activation]
-      F --> G[Interneuron branch\nconv_exc_inter -> conv_inh]
-      G --> H[Candidate state\ncnm_pyr = post_inh(exc - inh)]
-      H --> I[Euler integration with learnable tau\nh_next = (1-tau)h + tau*cnm]
-      I --> J[AvgPool output]
-      J --> K[Optional cue-driven low-rank modulation\nouts = outs * (1 + rank1*0.1)]
-      K --> M[Optional feedback to lower layers]
+    subgraph L[Per-step and per-layer computation]
+      E["input to layer i<br/>raw image for i=0; previous layer output otherwise"] --> F["Excitatory update<br/>conv_exc_* plus pre_inh_activation"]
+      F --> G["Interneuron branch<br/>conv_exc_inter then conv_inh"]
+      G --> H["Candidate state<br/>cnm_pyr = post_inh(exc - inh)"]
+      H --> I["Euler integration with learnable tau<br/>h_next = (1 - tau) * h + tau * cnm"]
+      I --> J["Average pooling output"]
+      J --> K["Optional cue-driven low-rank modulation<br/>outs = outs * (1 + rank1 * 0.1)"]
+      K --> M["Optional feedback to lower layers"]
     end
 
-    D --> N[Take final top-layer output\n(outs[-1][-1] or all steps)]
-    N --> O[Head: flatten + FC + dropout + FC]
-    O --> P[Class logits]
-    P --> Q[argmax during metrics\nCrossEntropyLoss during training]
+    D --> N["Take final top-layer output<br/>outs[-1][-1] or all steps"]
+    N --> O["Head: flatten plus FC plus dropout plus FC"]
+    O --> P["Class logits"]
+    P --> Q["argmax for metrics<br/>CrossEntropyLoss during training"]
 ```
 
 ## Detailed training process (from `train_new2.py`)
