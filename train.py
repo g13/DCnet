@@ -13,7 +13,8 @@ from tqdm import tqdm
 from data import get_qclevr_dataloaders
 from model import Conv2dEIRNN
 from utils import AttrDict, seed
-
+import numpy as np
+import matplotlib.pyplot as plt
 
 def train_iter(
     config: AttrDict,
@@ -184,10 +185,49 @@ def eval_iter(
     return test_loss, test_acc
 
 
+def plot_training_curves(history, save_path=None):
+    """
+    Plot training and validation loss/accuracy curves.
+    
+    Args:
+        history (dict): Dictionary containing training history
+        save_path (str): Path to save the plot image
+    """
+    epochs = range(1, len(history['train_loss']) + 1)
+    
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+    
+    # Plot loss
+    ax1.plot(epochs, history['train_loss'], 'b-', label='Train Loss', linewidth=2)
+    ax1.plot(epochs, history['test_loss'], 'r-', label='Test Loss', linewidth=2)
+    ax1.set_title('Training and Test Loss')
+    ax1.set_xlabel('Epochs')
+    ax1.set_ylabel('Loss')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    
+    # Plot accuracy
+    ax2.plot(epochs, history['train_acc'], 'b-', label='Train Accuracy', linewidth=2)
+    ax2.plot(epochs, history['test_acc'], 'r-', label='Test Accuracy', linewidth=2)
+    ax2.set_title('Training and Test Accuracy')
+    ax2.set_xlabel('Epochs')
+    ax2.set_ylabel('Accuracy')
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Training curves saved to: {save_path}")
+    
+    plt.show()
+
+
 @hydra.main(
     version_base=None,
     config_path="config",
-    config_name="config",
+    config_name="config1.yaml",
 )
 def train(config: DictConfig) -> None:
     """
@@ -259,6 +299,21 @@ def train(config: DictConfig) -> None:
         seed=config.seed,
     )
 
+    # 在训练循环开始前添加检查
+    train_labels = [label for _, _, label in train_loader.dataset]
+    print("原始训练集类别分布:", torch.bincount(torch.tensor(train_labels)))
+    val_labels = [label for _, _, label in val_loader.dataset]
+    print("原始验证集类别分布:", torch.bincount(torch.tensor(val_labels)))
+
+    # 检查采样后的批次分布
+    for batch_idx, (cue, mixture, labels) in enumerate(train_loader):
+        if batch_idx == 0:  # 只检查第一个 batch
+            print("采样后的首个batch类别分布:", torch.bincount(labels))
+            break
+    
+    print(f"训练集总样本数: {len(train_loader.dataset)}")
+    print(f"验证集总样本数: {len(val_loader.dataset)}")
+
     # Initialize the learning rate scheduler
     if config.scheduler.fn is None:
         scheduler = None
@@ -285,6 +340,15 @@ def train(config: DictConfig) -> None:
         checkpoint_dir = config.checkpoint.root
     os.makedirs(checkpoint_dir, exist_ok=True)
 
+    # Initialize training history
+    history = {
+        'train_loss': [],
+        'train_acc': [],
+        'test_loss': [],
+        'test_acc': [],
+        'epochs': []
+    }
+
     for epoch in range(config.train.epochs):
         # Train the model
         train_loss, train_acc = train_iter(
@@ -304,6 +368,13 @@ def train(config: DictConfig) -> None:
             config, model, criterion, val_loader, wandb_log, epoch, device
         )
 
+        # Store history
+        history['train_loss'].append(train_loss)
+        history['train_acc'].append(train_acc)
+        history['test_loss'].append(test_loss)
+        history['test_acc'].append(test_acc)
+        history['epochs'].append(epoch)
+
         # Print the epoch statistics
         print(
             f"Epoch [{epoch}/{config.train.epochs}] | "
@@ -322,14 +393,30 @@ def train(config: DictConfig) -> None:
             "epoch": epoch,
             "model_state_dict": getattr(model, "_orig_mod", model).state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
+            "history": history  # 保存训练历史
         }
         torch.save(checkpoint, file_path)
+        import shutil
         try:
             os.remove(link_path)
         except FileNotFoundError:
             pass
-        os.symlink(file_path, link_path)
+        shutil.copy2(file_path, link_path)
 
+        # Plot training curves every few epochs or at the end
+        if (epoch + 1) % 10 == 0 or epoch == config.train.epochs - 1:
+            plot_save_path = os.path.join(checkpoint_dir, f"training_curves_epoch_{epoch}.png")
+            plot_training_curves(history, plot_save_path)
+
+    # Final plot
+    final_plot_path = os.path.join(checkpoint_dir, "final_training_curves.png")
+    plot_training_curves(history, final_plot_path)
+    
+    # Save history to file
+    history_path = os.path.join(checkpoint_dir, "training_history.npy")
+    np.save(history_path, history)
+    print(f"Training history saved to: {history_path}")
 
 if __name__ == "__main__":
     train()
+    

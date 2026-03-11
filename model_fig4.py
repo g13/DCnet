@@ -7,43 +7,6 @@ import torch.nn as nn
 
 from utils import get_activation_class
 
-
-class LowRankModulation(nn.Module):
-    def __init__(self, in_channels, spatial_size: tuple[int, int]):
-        super().__init__()
-
-        self.in_channels = in_channels
-        self.spatial_size = spatial_size
-
-        # # B x C x H  W
-        # self.W = nn.Parameter(torch.randn(1, hc, hx, 1))
-        # self.bias = nn.Parameter(torch.randn(1, hc, hx, 1))
-
-        # outsize is N X C X 1 X 1
-        self.spatial_average = nn.AdaptiveAvgPool2d((1, 1))
-        self.rank_one_vec_h = nn.Linear(in_channels, spatial_size[0])
-        self.rank_one_vec_w = nn.Linear(in_channels, spatial_size[1])
-
-    def forward(self, cue: torch.Tensor, mixture: torch.Tensor):
-        # rank_one_vector = torch.matmul(input, self.W) + self.bias
-        # # compute the rank one matrix
-        # rank_one_perturbation = torch.matmul(rank_one_vector, rank_one_vector.transpose(-2, -1))
-        # perturbed_input = input + rank_one_perturbation
-        # return perturbed_input
-
-        x = self.spatial_average(cue)
-        x = x.flatten(1)
-        hvec = self.rank_one_vec_h(x)
-        wvec = self.rank_one_vec_w(x)
-
-        rank_one_matrix = torch.bmm(
-            hvec.unsqueeze(-1), wvec.unsqueeze(-2)
-        ).unsqueeze(-3)
-        rank_one_tensor = x.unsqueeze(-1).unsqueeze(-1) * rank_one_matrix
-
-        return mixture * rank_one_tensor
-        #return mixture * (1 + rank_one_tensor * 0.1)
-
 '''class LowRankModulation(nn.Module):
 #class SimpleLowRankModulation(nn.Module):
     def __init__(self, in_channels, spatial_size: tuple[int, int], hidden_dim: int = 32):
@@ -82,7 +45,64 @@ class LowRankModulation(nn.Module):
         
         # 残差连接：X * (1 + M)
         return mixture * (1 + modulation_tensor)'''
+class LowRankModulation(nn.Module):
+    def __init__(self, in_channels, spatial_size: tuple[int, int]):
+        super().__init__()
 
+        self.in_channels = in_channels
+        self.spatial_size = spatial_size
+
+        # # B x C x H  W
+        # self.W = nn.Parameter(torch.randn(1, hc, hx, 1))
+        # self.bias = nn.Parameter(torch.randn(1, hc, hx, 1))
+
+        # outsize is N X C X 1 X 1
+        self.spatial_average = nn.AdaptiveAvgPool2d((1, 1))
+        self.rank_one_vec_h = nn.Linear(in_channels, spatial_size[0])
+        self.rank_one_vec_w = nn.Linear(in_channels, spatial_size[1])
+
+    def forward(self, cue: torch.Tensor, mixture: torch.Tensor):
+        # rank_one_vector = torch.matmul(input, self.W) + self.bias
+        # # compute the rank one matrix
+        # rank_one_perturbation = torch.matmul(rank_one_vector, rank_one_vector.transpose(-2, -1))
+        # perturbed_input = input + rank_one_perturbation
+        # return perturbed_input
+
+        x = self.spatial_average(cue)
+        x = x.flatten(1)
+        hvec = self.rank_one_vec_h(x)
+        wvec = self.rank_one_vec_w(x)
+
+        rank_one_matrix = torch.bmm(
+            hvec.unsqueeze(-1), wvec.unsqueeze(-2)
+        ).unsqueeze(-3)
+        rank_one_tensor = x.unsqueeze(-1).unsqueeze(-1) * rank_one_matrix
+
+        #return mixture * rank_one_tensor
+        return mixture * (1 + rank_one_tensor * 0.1)
+
+class LowRankModulation_mute(nn.Module):
+    def __init__(self, in_channels, spatial_size: tuple[int, int], hidden_dim: Optional[int] = None):
+        super().__init__()
+        self.in_channels = in_channels
+        self.spatial_size = spatial_size
+
+        self.spatial_average = nn.AdaptiveAvgPool2d((1, 1))
+        
+        # 添加 dummy 参数以兼容旧checkpoint
+        self.channel_modulator = nn.Identity()  # 不执行任何操作
+        self.rank_one_vec_h = nn.Identity()
+        self.rank_one_vec_w = nn.Identity()
+        
+        # 如果 hidden_dim 提供了，也兼容
+        if hidden_dim is not None:
+            # 可以创建但不会使用的参数
+            self.dummy_param = nn.Parameter(torch.zeros(1))
+    
+    def forward(self, cue: torch.Tensor, mixture: torch.Tensor):
+        # 静默调制：直接返回 mixture，不进行任何修改
+        return mixture
+    
 class LowRankPerturbation(nn.Module):
     def __init__(self, in_channels: int, spatial_size: tuple[int, int]):
         """
@@ -206,8 +226,6 @@ class Conv2dEIRNNCell(nn.Module):
             self.tau_inter = nn.Parameter(
                 torch.randn((1, self.h_inter_dim, *input_size))
             )
-       
-        
 
         if exc_rectify == "pos":
             Conv2dExc = Conv2dPositive
@@ -628,43 +646,28 @@ class Conv2dEIRNN(nn.Module):
             self.modulations = nn.ModuleList()
             self.modulations_inter = nn.ModuleList()
             for i in range(num_layers):
-                if modulation_on == "hidden":
-                    self.modulations.append(
-                        LowRankModulation(
-                            self.h_pyr_dims[i],
-                            self.input_sizes[i],
-                        )
-                    )
-                    self.modulations_inter.append(
-                        LowRankModulation(
-                            self.h_inter_dims[i],
-                            self.input_sizes[i],
-                        )
-                    )
-                else:
-                    self.modulations.append(
+                '''self.modulations.append(
                         LowRankModulation(self.h_pyr_dims[i], self.output_sizes[i])
-                    )
-                    
-                    '''# modulation_on == "layer_output"：调制层输出
-                    # 关键：空间大小是 output_sizes[i]
-                    spatial_size = self.output_sizes[i]
-                    
-                    # 计算 hidden_dim
-                    pyr_hidden_dim = max(16, self.h_pyr_dims[i] // 2)
-                    
-                    # 只调制 pyramidal 输出（interneurons 没有直接输出）
-                    self.modulations.append(
+                    )'''
+                '''self.modulations.append(
                         LowRankModulation(
                             in_channels=self.h_pyr_dims[i],
                             spatial_size=spatial_size,  # 使用 output_sizes
                             hidden_dim=pyr_hidden_dim
                         )
+                    )'''
+                '''if  i == 3 or i == 2 or i == 1 or i == 0:
+                    self.modulations.append(
+                        LowRankModulation_mute(self.h_pyr_dims[i], self.output_sizes[i])
                     )
-                    
-                    # layer_output 模式下不调制 interneurons
-                    self.modulations_inter.append(None)
-'''
+                else:                  
+                    self.modulations.append(
+                        LowRankModulation(self.h_pyr_dims[i], self.output_sizes[i])
+                    )  '''    
+                self.modulations.append(
+                        LowRankModulation(self.h_pyr_dims[i], self.output_sizes[i])
+                    )                               
+
 
         self.out_layer = (
             nn.Sequential(

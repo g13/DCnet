@@ -9,7 +9,6 @@ import torch
 from PIL import Image, ImageDraw
 from torch.utils.data import DataLoader, Dataset
 from torchvision.transforms import transforms
-
 from utils import compact, rescale, seed_worker
 
 
