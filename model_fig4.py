@@ -7,6 +7,10 @@ import torch.nn as nn
 
 from utils import get_activation_class
 
+# This file is an experimental Figure 4 reproduction attempt. The default training/eval path in
+# train.py still imports `Conv2dEIRNN` from model.py, so nothing here affects standard runs unless
+# a separate script imports this file explicitly.
+
 '''class LowRankModulation(nn.Module):
 #class SimpleLowRankModulation(nn.Module):
     def __init__(self, in_channels, spatial_size: tuple[int, int], hidden_dim: int = 32):
@@ -78,6 +82,9 @@ class LowRankModulation(nn.Module):
         ).unsqueeze(-3)
         rank_one_tensor = x.unsqueeze(-1).unsqueeze(-1) * rank_one_matrix
 
+        # Here the modulation is residual/gain-style: cue-derived factor `1 + 0.1 * M` multiplies
+        # the pooled layer output. That makes a Figure 4-style lesion conceptually possible by
+        # replacing the factor with 1, but this file does not implement the full lesion sweep.
         #return mixture * rank_one_tensor
         return mixture * (1 + rank_one_tensor * 0.1)
 
@@ -100,7 +107,8 @@ class LowRankModulation_mute(nn.Module):
             self.dummy_param = nn.Parameter(torch.zeros(1))
     
     def forward(self, cue: torch.Tensor, mixture: torch.Tensor):
-        # 静默调制：直接返回 mixture，不进行任何修改
+        # This acts like a lesion helper by returning the unmodulated signal. In the current file it
+        # is never wired into the active modulation list, so the Figure 4 lesion experiment is absent.
         return mixture
     
 class LowRankPerturbation(nn.Module):
@@ -664,6 +672,9 @@ class Conv2dEIRNN(nn.Module):
                     self.modulations.append(
                         LowRankModulation(self.h_pyr_dims[i], self.output_sizes[i])
                     )  '''    
+                # Only pooled pyramidal outputs are modulated here. There is no cumulative D->A lesion
+                # schedule, no intact-vs-lesioned sweep, and no mechanism that swaps selected layers to
+                # `LowRankModulation_mute` during evaluation.
                 self.modulations.append(
                         LowRankModulation(self.h_pyr_dims[i], self.output_sizes[i])
                     )                               
@@ -842,6 +853,10 @@ class Conv2dEIRNN(nn.Module):
                                 h_inter_cue, h_inters[t][i]
                             )
                         else:
+                            # This uses same-layer cue outputs `outs_cue[t][i]` to modulate same-layer
+                            # scene outputs `outs[t][i]`. That is not yet a paper-faithful "higher-order
+                            # layer to sensory area" lesion target, and the file does not record the
+                            # per-condition accuracies needed for Figure 4.
                             out_cue = outs_cue[t][i]
                             outs[t][i] = self.modulations[i](
                                 out_cue, outs[t][i]
