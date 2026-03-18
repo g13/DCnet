@@ -1,6 +1,12 @@
 import os
 import random
+import shutil
+import subprocess
+import tempfile
+from datetime import date
+from pathlib import Path
 from types import SimpleNamespace
+from math import prod
 
 import numpy as np
 import scipy
@@ -102,6 +108,229 @@ def count_parameters(model):
     return total_params
 
 
+def summarize_parameter_counts(model, readout_prefix="out_layer"):
+    model = getattr(model, "_orig_mod", model)
+
+    def parameter_numel(param):
+        return (
+            param._nnz()
+            if param.layout in (torch.sparse_coo, torch.sparse_csr, torch.sparse_csc)
+            else param.numel()
+        )
+
+    total = 0
+    trainable = 0
+    readout = 0
+    prefix = f"{readout_prefix}."
+
+    for name, param in model.named_parameters():
+        num_params = parameter_numel(param)
+        total += num_params
+        if param.requires_grad:
+            trainable += num_params
+        if name.startswith(prefix):
+            readout += num_params
+
+    return {
+        "total": total,
+        "trainable": trainable,
+        "readout": readout,
+        "backbone": total - readout,
+    }
+
+
+def format_parameter_report(model, readout_prefix="out_layer"):
+    counts = summarize_parameter_counts(model, readout_prefix=readout_prefix)
+    return "\n".join(
+        [
+            "Model parameters:",
+            f"  total: {counts['total']:,}",
+            f"  trainable: {counts['trainable']:,}",
+            f"  backbone: {counts['backbone']:,}",
+            f"  readout: {counts['readout']:,}",
+        ]
+    )
+
+
+def _group_parameter_counts(model, prefixes):
+    model = getattr(model, "_orig_mod", model)
+    if isinstance(prefixes, str):
+        prefixes = (prefixes,)
+    total = 0
+    for name, param in model.named_parameters():
+        if any(name.startswith(prefix) for prefix in prefixes):
+            total += param.numel()
+    return total
+
+
+def format_mermaid_model_diagram(model):
+    model = getattr(model, "_orig_mod", model)
+
+    if not hasattr(model, "layers") or not hasattr(model, "out_layer"):
+        raise TypeError("Mermaid model diagram is only supported for Conv2dEIRNN-style models.")
+
+    counts = summarize_parameter_counts(model)
+    input_channels = model.layers[0].input_dim
+    input_h, input_w = model.input_sizes[0]
+
+    lines = ["```mermaid", "flowchart LR"]
+    lines.append(
+        f'    cue["Cue input<br/>[{input_channels}, {input_h}, {input_w}]<br/>visual cue image"]'
+    )
+    lines.append(
+        f'    scene["Scene input<br/>[{input_channels}, {input_h}, {input_w}]<br/>search image"]'
+    )
+    lines.append(f'    cuepass["Cue phase<br/>T = {model.num_steps} recurrent steps<br/>stores cue activations"]')
+    lines.append(f'    scenepass["Scene phase<br/>T = {model.num_steps} recurrent steps"]')
+
+    for i, layer in enumerate(model.layers):
+        area = chr(ord("A") + i)
+        state_h, state_w = model.input_sizes[i]
+        out_h, out_w = model.output_sizes[i]
+        layer_params = _group_parameter_counts(
+            model,
+            (
+                f"layers.{i}.",
+                f"modulations.{i}.",
+                f"modulations_inter.{i}.",
+                f"pertubations.{i}.",
+                f"pertubations_inter.{i}.",
+            ),
+        )
+        fb_in_params = 0
+        for name, param in model.named_parameters():
+            if name.startswith("fb_convs.") and name.split(".")[1].endswith(f"_{i}"):
+                fb_in_params += param.numel()
+        total_block_params = layer_params + fb_in_params
+        kernel_h, kernel_w = model.exc_kernel_sizes[i]
+        pad_h = kernel_h // 2
+        pad_w = kernel_w // 2
+        lines.append(
+            f'    area{i}["Area {area}<br/>state E/I: {model.h_pyr_dims[i]}/{model.h_inter_dims[i]} @ {state_h}x{state_w}<br/>kernel: {kernel_h}x{kernel_w}, pad: {pad_h}/{pad_w}<br/>pooled out: [{model.h_pyr_dims[i]}, {out_h}, {out_w}]<br/>params: {total_block_params:,}"]'
+        )
+
+    flatten_dim = model.h_pyr_dims[-1] * prod(model.output_sizes[-1])
+    hidden_linear = model.out_layer[1]
+    final_linear = model.out_layer[-1]
+    hidden_params = hidden_linear.weight.numel() + hidden_linear.bias.numel()
+    final_params = final_linear.weight.numel() + final_linear.bias.numel()
+
+    lines.append(f'    flatten["Flatten<br/>{flatten_dim:,}"]')
+    lines.append(
+        f'    fc1["FC hidden<br/>{flatten_dim:,} -> {hidden_linear.out_features}<br/>params: {hidden_params:,}"]'
+    )
+    lines.append(
+        f'    logits["Logits<br/>{hidden_linear.out_features} -> {final_linear.out_features}<br/>params: {final_params:,}"]'
+    )
+    lines.append(
+        f'    totals["Totals<br/>backbone: {counts["backbone"]:,}<br/>readout: {counts["readout"]:,}<br/>total: {counts["total"]:,}"]'
+    )
+
+    scene_chain = " --> ".join(["scenepass", *[f"area{i}" for i in range(len(model.layers))], "flatten", "fc1", "logits", "totals"])
+    lines.append("    cue --> cuepass")
+    lines.append("    scene --> scenepass")
+    lines.append(f"    {scene_chain}")
+    for i in range(len(model.layers)):
+        lines.append(f"    cuepass -. cue-conditioned modulation .-> area{i}")
+    lines.append("```")
+    return "\n".join(lines)
+
+
+def format_model_setup_report(model, include_mermaid=False, readout_prefix="out_layer"):
+    sections = [format_parameter_report(model, readout_prefix=readout_prefix)]
+    if include_mermaid:
+        sections.append("Model shape + parameter flow:")
+        sections.append(format_mermaid_model_diagram(model))
+    return "\n\n".join(sections)
+
+
+def _extract_mermaid_body(mermaid_report):
+    lines = mermaid_report.strip().splitlines()
+    if lines and lines[0].strip() == "```mermaid":
+        lines = lines[1:]
+    if lines and lines[-1].strip() == "```":
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
+
+
+def make_model_diagram_filename(when=None, commit_hash="unknown", output_format="pdf"):
+    when = when or date.today()
+    return f"flow_chart-{when.isoformat()}-{commit_hash}.{output_format}"
+
+
+def get_git_commit_hash(default="unknown"):
+    try:
+        return subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], text=True).strip()
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return default
+
+
+def resolve_model_output_mode(
+    show_model_diagram=False,
+    save_model_diagram_png=False,
+    output_model_structure_only=False,
+):
+    return {
+        "structure_only": output_model_structure_only,
+        "show_model_diagram": show_model_diagram or output_model_structure_only,
+        "save_model_diagram_png": save_model_diagram_png or output_model_structure_only,
+    }
+
+
+def _render_mermaid_with_mmdc(mermaid_report, output_path):
+    mmdc_path = shutil.which("mmdc")
+    if mmdc_path is None:
+        raise RuntimeError("Could not find 'mmdc' in PATH; cannot render Mermaid diagram.")
+
+    mermaid_body = _extract_mermaid_body(mermaid_report)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        input_path = Path(tmpdir) / "diagram.mmd"
+        input_path.write_text(mermaid_body, encoding="utf-8")
+        subprocess.run(
+            [mmdc_path, "-i", str(input_path), "-o", str(output_path), "-b", "white"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+
+def save_mermaid_diagram(
+    mermaid_report,
+    output_dir=".",
+    when=None,
+    commit_hash="unknown",
+    output_format="pdf",
+    renderer=None,
+):
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / make_model_diagram_filename(
+        when=when,
+        commit_hash=commit_hash,
+        output_format=output_format,
+    )
+    renderer = renderer or _render_mermaid_with_mmdc
+    renderer(_extract_mermaid_body(mermaid_report), output_path)
+    return output_path
+
+
+def save_mermaid_diagram_png(
+    mermaid_report,
+    output_dir=".",
+    when=None,
+    commit_hash="unknown",
+    renderer=None,
+):
+    return save_mermaid_diagram(
+        mermaid_report,
+        output_dir=output_dir,
+        when=when,
+        commit_hash=commit_hash,
+        output_format="png",
+        renderer=renderer,
+    )
+
+
 def profile_fn(fn, kwargs, sort_by="cuda_time_total", row_limit=50):
     with profile(
         activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
@@ -185,4 +414,6 @@ def compact(l):
 
 
 def rescale(x):
+    # qCLEVR images arrive from `ToTensor()` in [0, 1]. The training code uses [-1, 1]
+    # inputs for both cues and scenes before they are passed into the recurrent model.
     return x * 2 - 1

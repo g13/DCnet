@@ -6,9 +6,17 @@ hydra:
 model:
   input_size: [128, 128]
   input_dim: 3
+  # Layer widths for sensory areas A-D. Per-layer states use shapes
+  # h_pyr[l]: [B, h_pyr_dim[l], H_l, W_l] and h_inter[l]: [B, h_inter_dim[l], H_l, W_l].
+  # Appendix A.2 of the paper is closer to the current widths here: [16, 32, 64, 128]
+  # for pyramidal cells and [4, 8, 16, 32] for interneurons. The remaining tension is
+  # that these widths do not line up cleanly with the paper's separate ~1.8M parameter claim.
   h_pyr_dim: [16, 32, 64, 128]
   h_inter_dim: [4, 8, 16, 32]
   fb_dim: [16, 32, 64, 64]
+  # Kernel sizes for the E->E/E->I and I->E convolutions in each sensory area.
+  # Appendix A.2 is also closer to the current kernel stack [5,5],[5,5],[5,5],[3,3]
+  # than to the original public code's [5,5],[5,5],[3,3],[3,3].
   exc_kernel_size: 
   - [5, 5]
   - [5, 5]
@@ -21,12 +29,19 @@ model:
   - [3, 3]
   immediate_inhibition: True
   num_layers: 4
+  # The repo's DCnet uses 5 cue steps and 5 scene steps. Appendix B explicitly states T=3 for
+  # the Convolutional RNN baseline; the paper is less explicit about DCnet's T, so this remains
+  # a text-vs-code ambiguity rather than a clean match.
   num_steps: 5
   num_classes: 6
 
   modulation: True
   #modulation_type: ag
+  # `lr` matches the paper's low-rank modulation story; the original config's `ag`
+  # default does not instantiate against the current model code.
   modulation_type: lr
+  # In the active path, modulation acts on pooled layer outputs `outs[t][i]`
+  # with shape [B, h_pyr_dim[i], H_{i+1}, W_{i+1}], not directly on raw pixels.
   modulation_on: layer_output
   #modulation_timestep: all
   modulation_timestep: all
@@ -37,6 +52,8 @@ model:
   layer_time_delay: False
   exc_rectify: Null
   inh_rectify: pos
+  # When True, the recurrent state is reset before the scene phase. Cue information still
+  # reaches the scene phase through stored cue activations used by the modulation path.
   flush_hidden: True
   hidden_init_mode: zeros
   fb_init_mode: zeros
@@ -59,22 +76,30 @@ data:
   root: /scratch/wyy/data/color_less
   assets_path: data/CLEVR_v1.0/cues
   #batch_size: 256
+  # Paper/original setup used 256. The current training loop does not implement
+  # gradient accumulation, so this value is the true optimizer batch size.
   batch_size: 128
   val_batch_size: 64
   #holdout: [blue, green]
+  # Empty holdout disables the cue-holdout generalization split discussed in the paper.
   holdout: []
+  # `color`, `shape`, and `conjunction` are all supported by the dataset code.
+  # This active config only trains/evals color trials.
   mode: color
   primitive: True
   num_workers: 8
 optimizer: 
   fn: adamw
   #lr: 0.0004
+  # The paper appendix reports AdamW with max lr 4e-4. The current value is larger.
   lr: 0.001
   momentum: 0.9
   beta1: 0.9
   beta2: 0.999
 scheduler:
   fn: one_cycle
+  # `pct_start` matches the paper appendix numerically, but train.py currently relies on
+  # the library default instead of passing this config value explicitly.
   pct_start: 0.3
 criterion: 
   fn: ce
@@ -87,6 +112,7 @@ compile:
   mode: reduce-overhead
 train:
   amp: true  # 启用混合精度
+  # This knob is not consumed by train.py yet, so it does not emulate a larger batch.
   accumulation_steps: 4  # 梯度累积步数
   empty_cache_freq: 100  
 
@@ -96,6 +122,7 @@ train:
   log_freq: 5
   grad_clip:
     #disable: True
+    # The original config disabled clipping; enabling it changes optimizer behavior.
     disable: False
     type: norm
     value: 1.0
@@ -108,7 +135,9 @@ checkpoint:
 seed: 42
 tqdm: True
 wandb: False
+show_model_diagram: True
+save_model_diagram_png: True
+model_diagram_output_dir: .
+output_model_structure_only: True
 
 verbose: True  # 控制是否打印详细日志
-
-

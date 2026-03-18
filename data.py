@@ -86,6 +86,9 @@ class qCLEVRDataset(Dataset):
         self._modes = (
             ["color", "shape", "conjunction"] if self.mode == "every" else [self.mode]
         )
+        # Each mode corresponds to a separate qCLEVR split on disk. A sample returned by this
+        # dataset is `(cue_tensor, scene_tensor, count_label)`, where cue/scene are later batched
+        # into [B, 3, 128, 128] tensors and `count_label` is an integer target count in 0..5.
         self.data_paths = {
             _mode: os.path.join(data_root, "{}_{}".format(split, _mode), "images")
             for _mode in self._modes
@@ -180,6 +183,9 @@ class qCLEVRDataset(Dataset):
     def get_file(self, _mode, scene_path):
         with open(scene_path, "r") as f:
             x = json.load(f)
+            # Scene metadata stores the rendered image filename, the cue specification, and the
+            # target count. Holdout filtering is cue-based only here; there is no scene-level
+            # holdout mechanism in this loader.
             cue_type = x["cue"]
             if _mode == "conjunction":
                 cue_type = "{}_{}".format(cue_type[0], cue_type[1])
@@ -234,8 +240,12 @@ class qCLEVRDataset(Dataset):
         img = Image.open(image_path)
         img = img.convert("RGB")
 
-        # create a cue and get the right numerical label
+        # `img` is the scene image. `cue` is synthesized on the fly so that the recurrent model
+        # receives a visual cue image followed by the scene image, which is the repo's intended
+        # approximation to the paper's cue-then-scene protocol.
+        # Before batching, both transformed tensors have shape [3, 128, 128].
         if mode == "color":
+            # Color cues become full-frame solid RGB patches, mirroring the repo's color-cue condition.
             cue = img.copy()
             cue.paste(self.color_dict[cue_str], [0, 0, cue.size[0], cue.size[1]])
         elif mode == "shape":
@@ -272,6 +282,8 @@ def get_qclevr_dataloaders(
     num_workers: int = 0,
     seed: Optional[int] = None,
 ):
+    # Transform order is: PIL image -> tensor in [0, 1] with shape [3, H, W] -> rescale to
+    # [-1, 1] -> resize to the model input resolution (128x128 in the active configs).
     clevr_transforms = transforms.Compose(
         [
             transforms.ToTensor(),

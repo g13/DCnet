@@ -93,3 +93,7 @@ checkpoint:
 seed: Null
 tqdm: True
 wandb: False
+show_model_diagram: False
+save_model_diagram_png: False
+model_diagram_output_dir: .
+output_model_structure_only: False

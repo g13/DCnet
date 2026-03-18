@@ -30,7 +30,10 @@ class LowRankModulation(nn.Module):
         # rank_one_perturbation = torch.matmul(rank_one_vector, rank_one_vector.transpose(-2, -1))
         # perturbed_input = input + rank_one_perturbation
         # return perturbed_input
-
+        # In the active `layer_output` path, both tensors are usually pooled layer outputs
+        # with shape [B, C_l, H_out_l, W_out_l] = [B, C_l, H_{l+1}, W_{l+1}]. Spatial averaging
+        # collapses the cue to [B, C_l], then two learned projections produce a rank-1 spatial
+        # factor over the pooled spatial grid.
         x = self.spatial_average(cue)
         x = x.flatten(1)
         hvec = self.rank_one_vec_h(x)
@@ -41,6 +44,10 @@ class LowRankModulation(nn.Module):
         ).unsqueeze(-3)
         rank_one_tensor = x.unsqueeze(-1).unsqueeze(-1) * rank_one_matrix
 
+        # Shape summary: rank_one_matrix is [B, 1, H_l, W_l], rank_one_tensor is
+        # [B, C_l, H_l, W_l]. The current branch applies a pure multiplicative modulation
+        # `mixture * M`; the paper also describes multiplicative modulation, but this is more
+        # aggressive than the residual-style variant left commented out below.
         return mixture * rank_one_tensor
         #return mixture * (1 + rank_one_tensor * 0.1)
 
@@ -356,6 +363,11 @@ class Conv2dEIRNNCell(nn.Module):
         if self.use_fb and fb is None:
             raise ValueError("If use_fb is True, fb_exc must be provided.")
 
+        # `input` is the bottom-up drive z^(l) for this area with shape [B, C_in, H_l, W_l].
+        # `h_pyr` and `h_inter` are the excitatory/inhibitory recurrent states for the same area,
+        # shaped [B, h_pyr_dim, H_l, W_l] and [B, h_inter_dim, H_l, W_l]. `fb` is optional
+        # top-down feedback from the next area projected back to this area's spatial scale.
+
         # Compute the excitations for pyramidal cells
         exc_cat = [input, h_pyr]
         if self.use_fb:
@@ -384,6 +396,8 @@ class Conv2dEIRNNCell(nn.Module):
             cnm_inter = self.post_inh_activation(exc_inter)
 
         # Euler update for the cell state
+        # Sigmoid constrains the learned time constants to (0, 1), so each update is an
+        # interpolation between the previous state and the current candidate state.
         tau_pyr = torch.sigmoid(self.tau_pyr)
         h_next_pyr = (1 - tau_pyr) * h_pyr + tau_pyr * cnm_pyr
 
@@ -394,6 +408,9 @@ class Conv2dEIRNNCell(nn.Module):
             h_next_inter = None
 
         # Pool the output
+        # `out` is the feedforward excitatory readout for the next area. With stride-2 pooling,
+        # its shape is [B, h_pyr_dim, H_{l+1}, W_{l+1}]. This is the quantity modulated in the
+        # active `layer_output` configuration, which is the repo's closest analogue to Appendix A.1.
         out = self.out_pool(h_next_pyr)
 
         return h_next_pyr, h_next_inter, out
@@ -530,6 +547,9 @@ class Conv2dEIRNN(nn.Module):
             )
         self.output_sizes = self.input_sizes[1:]
         self.input_sizes = self.input_sizes[:-1]
+        # Layer indexing is bottom-up: layer 0 is the earliest sensory area (paper area A),
+        # and layer 3 is the latest sensory area (paper area D). Input/output sizes follow the
+        # retinotopic pyramid induced by stride-2 pooling.
 
         self.use_fb = [False] * num_layers
         self.fb_adjacency = fb_adjacency
@@ -642,6 +662,9 @@ class Conv2dEIRNN(nn.Module):
                         )
                     )
                 else:
+                    # Active path: modulate pooled excitatory outputs `outs[t][i]`, each shaped
+                    # [B, h_pyr_dim[i], H_{i+1}, W_{i+1}]. This is the repo's closest implementation
+                    # to the paper's low-rank modulation of pooled excitatory activity.
                     self.modulations.append(
                         LowRankModulation(self.h_pyr_dims[i], self.output_sizes[i])
                     )
@@ -755,6 +778,10 @@ class Conv2dEIRNN(nn.Module):
         h_pyrs_cue = None
         h_inters_cue = None
         outs_cue = None
+        # The model processes two stimulation phases in order: first the cue, then the scene.
+        # Each phase is unrolled for `num_steps=T`. With `flush_hidden=True`, the recurrent state
+        # is reset before the scene phase; cue information is then reintroduced through `*_cue`
+        # tensors used by the modulation pathway.
         for stimulation in (cue, mixture):
             if stimulation is None:
                 continue
@@ -805,6 +832,10 @@ class Conv2dEIRNN(nn.Module):
                             outs[t][i] = outs[t][i] + pertubations_out[i]
 
                     # Compute layer update and output
+                    # `outs[t][i]` is the pooled excitatory output for layer `i` at timestep `t`.
+                    # Shapes by layer in the active config are approximately:
+                    # i=0: [B, 16, 64, 64], i=1: [B, 32, 32, 32], i=2: [B, 64, 16, 16],
+                    # i=3: [B, 128, 8, 8].
                     (h_pyrs[t][i], h_inters[t][i], outs[t][i]) = layer(
                         input=(
                             input
@@ -839,6 +870,10 @@ class Conv2dEIRNN(nn.Module):
                                 h_inter_cue, h_inters[t][i]
                             )
                         else:
+                            # Scene-phase outputs are modulated by cue-phase outputs from the same
+                            # timestep/layer index: `outs_cue[t][i]` and `outs[t][i]` share shape
+                            # [B, h_pyr_dim[i], H_{i+1}, W_{i+1}]. This is a within-layer cue-to-scene
+                            # modulation path, not an explicit separate higher-order area object.
                             out_cue = outs_cue[t][i]
                             outs[t][i] = self.modulations[i](
                                 out_cue, outs[t][i]
@@ -871,6 +906,7 @@ class Conv2dEIRNN(nn.Module):
         if all_timesteps:
             out = []
             for t in range(self.num_steps):
+                # Each element is a logits tensor [B, num_classes] computed from the last sensory area.
                 out.append(self.out_layer(outs[t][-1]))
         else:
             out = self.out_layer(outs[-1][-1])

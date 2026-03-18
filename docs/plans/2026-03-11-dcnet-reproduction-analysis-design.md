@@ -6,7 +6,7 @@ Analyze how the current repository differs from the paper "Flexible Context-Driv
 
 ## Approved Scope
 
-- Compare `c27578b` (original) against `dbb3b0f` (current) and against the paper.
+- Compare `c27578b` (original) against the current amended latest commit (`d297332`) and against the paper.
 - Treat only behavior-affecting differences as reproduction-critical unless explicitly noted otherwise.
 - Ignore the absolute `data.root` path difference.
 - Do not run full training; use only small smoke tests if verification is needed.

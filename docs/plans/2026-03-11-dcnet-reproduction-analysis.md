@@ -13,7 +13,6 @@
 ### Task 1: Capture paper-critical setup differences
 
 **Files:**
-- Modify: `docs/plans/2026-03-11-dcnet-reproduction-analysis-design.md`
 - Create: `docs/reproduction-paper-alignment.md`
 - Reference: `config/config1.yaml`
 - Reference: `config/config.yaml.bak`
@@ -29,7 +28,7 @@ Use the paper text to record the expected setup values and behaviors.
 
 **Step 3: Fill in the original/current commit columns**
 
-Use git history and checked-in files to capture what `c27578b` and `dbb3b0f` actually do.
+Use git history and checked-in files to capture what `c27578b` and `d297332` actually do.
 
 **Step 4: Add closest-paper recommendations**
 

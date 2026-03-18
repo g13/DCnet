@@ -12,7 +12,15 @@ from tqdm import tqdm
 
 from data import get_qclevr_dataloaders
 from model import Conv2dEIRNN
-from utils import AttrDict, seed
+from utils import (
+    AttrDict,
+    format_mermaid_model_diagram,
+    format_model_setup_report,
+    get_git_commit_hash,
+    resolve_model_output_mode,
+    save_mermaid_diagram,
+    seed,
+)
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -67,11 +75,17 @@ def train_iter(
         disable=not config.tqdm,
     )
     for i, (cue, mixture, labels) in enumerate(bar):
+        # qCLEVR batches are cue image, scene image, and count label:
+        # cue: [B, 3, 128, 128], mixture(scene): [B, 3, 128, 128], labels: [B].
+        # The labels are class indices for target counts 0..5.
         cue = cue.to(device)
         mixture = mixture.to(device)
         labels = labels.to(device)
 
         # Forward pass
+        # The model internally runs a cue phase and then a scene phase. The default
+        # output is a single logits tensor [B, 6]; with `all_timesteps=True` it returns
+        # one logits tensor per scene-phase step.
         outputs = model(cue, mixture, all_timesteps=config.criterion.all_timesteps)
         if config.criterion.all_timesteps:
             losses = []
@@ -245,7 +259,33 @@ def train(config: DictConfig) -> None:
     torch.set_float32_matmul_precision(config.train.matmul_precision)
     # Get device and initialize the model
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    output_mode = resolve_model_output_mode(
+        show_model_diagram=config.get("show_model_diagram", False),
+        save_model_diagram_png=config.get("save_model_diagram_png", False),
+        output_model_structure_only=config.get("output_model_structure_only", False),
+    )
+    # The main training path always imports `Conv2dEIRNN` from model.py. `model_fig4.py`
+    # is an auxiliary Figure 4 reproduction attempt and is not used here by default.
     model = Conv2dEIRNN(**config.model).to(device)
+    print(
+        format_model_setup_report(
+            model,
+            include_mermaid=output_mode["show_model_diagram"],
+        )
+    )
+    if output_mode["save_model_diagram_png"]:
+        try:
+            output_path = save_mermaid_diagram(
+                format_mermaid_model_diagram(model),
+                output_dir=config.get("model_diagram_output_dir", "."),
+                commit_hash=get_git_commit_hash(default="unknown"),
+            )
+            print(f"Saved model diagram to: {output_path}")
+        except Exception as exc:
+            print(f"Warning: could not save model diagram: {exc}")
+    if output_mode["structure_only"]:
+        print("Model structure only mode enabled; skipping compile, data loading, and training.")
+        return
 
     # Compile the model if requested
     model = torch.compile(
@@ -286,6 +326,8 @@ def train(config: DictConfig) -> None:
         raise NotImplementedError(f"Criterion {config.criterion.fn} not implemented")
 
     # Get the data loaders
+    # Dataloaders batch cue images and scene images separately. This code path is the repo's
+    # recurrent cue-then-scene implementation, as opposed to an implicit stacked-input baseline.
     train_loader, val_loader = get_qclevr_dataloaders(
         data_root=config.data.root,
         assets_path=config.data.assets_path,
@@ -299,7 +341,8 @@ def train(config: DictConfig) -> None:
         seed=config.seed,
     )
 
-    # 在训练循环开始前添加检查
+    # Debugging statistics added in the current branch. These help inspect class balance,
+    # but they are not part of the paper's reported training recipe.
     train_labels = [label for _, _, label in train_loader.dataset]
     print("原始训练集类别分布:", torch.bincount(torch.tensor(train_labels)))
     val_labels = [label for _, _, label in val_loader.dataset]
@@ -318,6 +361,8 @@ def train(config: DictConfig) -> None:
     if config.scheduler.fn is None:
         scheduler = None
     if config.scheduler.fn == "one_cycle":
+        # Note: config.scheduler.pct_start is defined, but the current code does not pass it
+        # into OneCycleLR, so the scheduler uses the library default warmup fraction.
         scheduler = OneCycleLR(
             optimizer,
             max_lr=config.optimizer.lr,
