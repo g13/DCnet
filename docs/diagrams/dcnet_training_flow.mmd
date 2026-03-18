@@ -1,0 +1,41 @@
+flowchart TD
+    A[Create or activate conda env] --> B[Install matching requirements file]
+    B --> C[`python train.py`]
+    C --> D[Hydra loads `config/config1.yaml`]
+
+    D --> E[Build qCLEVR dataloaders]
+    E --> E1[Each sample yields cue image, mixture image, target count]
+
+    D --> F[Instantiate `Conv2dEIRNN`]
+    F --> F1[4 recurrent conv EI layers]
+    F --> F2[5 recurrent steps per stimulus]
+    F --> F3[Low-rank cue modulation on layer outputs]
+    F --> F4[Feedback path: L2->L1, L3->L2, L4->L3]
+
+    E1 --> G[Training loop]
+    F --> G
+    G --> H[Cue pass primes hidden states]
+    H --> I[Mixture pass reuses cue context]
+
+    I --> J[Per layer and timestep: excitatory update]
+    J --> K[Interneuron inhibition and Euler state update]
+    K --> L[Average pooling produces next layer input]
+    L --> M[Apply cue-driven low-rank modulation]
+    M --> N[Apply top-down feedback to lower layers]
+
+    N --> O[Final layer output]
+    O --> P[MLP head: Flatten -> Linear -> ReLU -> Dropout -> Linear]
+    P --> Q[6-way count logits]
+    Q --> R[CrossEntropy loss]
+    R --> S[AdamW + OneCycleLR + gradient clipping]
+    S --> T[Save checkpoints and training curve PNGs]
+
+    classDef cmd fill:#f5f1e8,stroke:#8a6d3b,color:#2c2416;
+    classDef data fill:#e6f4ea,stroke:#2f7a4b,color:#163222;
+    classDef model fill:#e8eefc,stroke:#3e63b3,color:#15264b;
+    classDef train fill:#f9e8ef,stroke:#b24a72,color:#4b1829;
+
+    class A,B,C cmd;
+    class D,E,E1 data;
+    class F,F1,F2,F3,F4,H,I,J,K,L,M,N,O,P,Q model;
+    class G,R,S,T train;
