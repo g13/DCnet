@@ -207,11 +207,12 @@ class Conv2dEIRNNCell(nn.Module):
             ceil(input_size[1] / pool_stride[1]),
         )
 
-        # Learnable membrane time constants for excitatory and inhibitory cell populations
-        self.tau_pyr = nn.Parameter(torch.randn((1, h_pyr_dim, *input_size)))
+        # Learnable membrane time constants for excitatory and inhibitory cell populations.
+        # The paper treats these as one value per feature channel, broadcast over space.
+        self.tau_pyr = nn.Parameter(torch.randn((1, h_pyr_dim, 1, 1)))
         if h_inter_dim > 0:
             self.tau_inter = nn.Parameter(
-                torch.randn((1, self.h_inter_dim, *input_size))
+                torch.randn((1, self.h_inter_dim, 1, 1))
             )
        
         

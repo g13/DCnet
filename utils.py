@@ -3,6 +3,7 @@ import random
 import shutil
 import subprocess
 import tempfile
+import html
 from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
@@ -163,7 +164,158 @@ def _group_parameter_counts(model, prefixes):
     return total
 
 
-def format_mermaid_model_diagram(model):
+def _format_feature_shape(channels, height, width):
+    return f"[{channels}, {height}, {width}]"
+
+
+def _format_mermaid_node_label(title, *details):
+    rows = ["<div style='text-align:left'><table style='border-spacing:0'>"]
+    rows.append(
+        f"<tr><td colspan='3' style='white-space:nowrap'><b>{html.escape(title)}</b></td></tr>"
+    )
+    for detail in details:
+        if not detail:
+            continue
+        if ": " in detail:
+            key, value = detail.split(": ", 1)
+            rows.append(
+                f"<tr><td style='white-space:nowrap;padding-right:6px'>{html.escape(key)}</td><td style='white-space:nowrap;padding:0 4px'>:</td><td style='white-space:nowrap'>{html.escape(value)}</td></tr>"
+            )
+        else:
+            rows.append(
+                f"<tr><td colspan='3' style='white-space:nowrap'>{html.escape(detail)}</td></tr>"
+            )
+    rows.append("</table></div>")
+    return "".join(rows)
+
+
+def _append_mermaid_class(lines, class_name, nodes):
+    if nodes:
+        lines.append(f"    class {','.join(nodes)} {class_name};")
+
+
+def _count_bias_parameters(module):
+    return sum(
+        param.numel()
+        for name, param in module.named_parameters()
+        if name.split(".")[-1] == "bias"
+    )
+
+
+def _format_conv_train_dims(conv):
+    kernel_h, kernel_w = conv.kernel_size
+    return f"{conv.in_channels} -> {conv.out_channels} @ {kernel_h}x{kernel_w}"
+
+
+def _format_ff_rc_fb_label(use_fb):
+    return "ff+rc+fb" if use_fb else "ff+rc"
+
+
+def _estimate_mermaid_text_width(text):
+    if not text:
+        return 0
+    return len(text)
+
+
+def _estimate_mermaid_chain_width(model):
+    node_widths = [
+        max(
+            _estimate_mermaid_text_width("Scene phase"),
+            _estimate_mermaid_text_width(
+                f"steps: T = {model.num_steps} recurrent steps"
+            ),
+        )
+    ]
+
+    for i, layer in enumerate(model.layers):
+        state_h, state_w = model.input_sizes[i]
+        out_h, out_w = model.output_sizes[i]
+        ff_rc_fb_label = _format_ff_rc_fb_label(model.use_fb[i])
+        details = [
+            f"rc state pyr/inter: {model.h_pyr_dims[i]}/{model.h_inter_dims[i]} @ {state_h}x{state_w}",
+            f"ff in: {_format_feature_shape(layer.input_dim, state_h, state_w)}",
+            (
+                f"fb in: {_format_feature_shape(model.fb_dims[i], state_h, state_w)}"
+                if model.use_fb[i]
+                else None
+            ),
+            f"ff pool out pyr: {_format_feature_shape(model.h_pyr_dims[i], out_h, out_w)}",
+            f"{ff_rc_fb_label} conv to pyr: {_format_conv_train_dims(layer.conv_exc_pyr)}",
+            (
+                f"{ff_rc_fb_label} conv to inter: {_format_conv_train_dims(layer.conv_exc_inter)}"
+                if layer.h_inter_dim > 0
+                else None
+            ),
+            (
+                f"rc conv inter->pyr: {_format_conv_train_dims(layer.conv_inh)}"
+                if layer.h_inter_dim > 0
+                else None
+            ),
+            f"bias: {_count_bias_parameters(layer):,}",
+            (
+                f"tau pyr/inter: {layer.tau_pyr.numel()} / {layer.tau_inter.numel()}"
+                if layer.h_inter_dim > 0
+                else f"tau pyr: {layer.tau_pyr.numel()}"
+            ),
+            f"rc cell params: {_group_parameter_counts(model, f'layers.{i}.'):,}",
+        ]
+        node_widths.append(
+            max(
+                [_estimate_mermaid_text_width(f"Area {chr(ord('A') + i)}")]
+                + [_estimate_mermaid_text_width(detail) for detail in details if detail]
+            )
+        )
+
+    flatten_dim = model.h_pyr_dims[-1] * prod(model.output_sizes[-1])
+    hidden_linear = model.out_layer[1]
+    final_linear = model.out_layer[-1]
+    hidden_params = hidden_linear.weight.numel() + hidden_linear.bias.numel()
+    final_params = final_linear.weight.numel() + final_linear.bias.numel()
+    counts = summarize_parameter_counts(model)
+
+    node_widths.extend(
+        [
+            max(_estimate_mermaid_text_width("Flatten"), _estimate_mermaid_text_width(f"{flatten_dim:,}")),
+            max(
+                _estimate_mermaid_text_width("ff fc hidden"),
+                _estimate_mermaid_text_width(
+                    f"ff fc: {flatten_dim:,} -> {hidden_linear.out_features}"
+                ),
+                _estimate_mermaid_text_width(f"bias: {hidden_linear.bias.numel():,}"),
+                _estimate_mermaid_text_width(f"params: {hidden_params:,}"),
+            ),
+            max(
+                _estimate_mermaid_text_width("ff fc Logits"),
+                _estimate_mermaid_text_width(
+                    f"ff fc: {hidden_linear.out_features} -> {final_linear.out_features}"
+                ),
+                _estimate_mermaid_text_width(f"bias: {final_linear.bias.numel():,}"),
+                _estimate_mermaid_text_width(f"params: {final_params:,}"),
+            ),
+            max(
+                _estimate_mermaid_text_width("Totals"),
+                _estimate_mermaid_text_width(f"backbone: {counts['backbone']:,}"),
+                _estimate_mermaid_text_width(f"readout: {counts['readout']:,}"),
+                _estimate_mermaid_text_width(f"total: {counts['total']:,}"),
+            ),
+        ]
+    )
+
+    return sum(node_widths) + 10 * max(len(node_widths) - 1, 0)
+
+
+def _choose_mermaid_flow_direction(model, layout="auto"):
+    if layout == "landscape":
+        return "LR"
+    if layout == "portrait":
+        return "TB"
+    if layout != "auto":
+        raise ValueError("layout must be 'auto', 'landscape', or 'portrait'.")
+
+    return "TB" if _estimate_mermaid_chain_width(model) > 180 else "LR"
+
+
+def format_mermaid_model_diagram(model, layout="auto"):
     model = getattr(model, "_orig_mod", model)
 
     if not hasattr(model, "layers") or not hasattr(model, "out_layer"):
@@ -173,41 +325,94 @@ def format_mermaid_model_diagram(model):
     input_channels = model.layers[0].input_dim
     input_h, input_w = model.input_sizes[0]
 
-    lines = ["```mermaid", "flowchart LR"]
+    flow_direction = _choose_mermaid_flow_direction(model, layout=layout)
+    lines = ["```mermaid", f"flowchart {flow_direction}"]
+    class_nodes = {
+        "io": ["cue", "scene"],
+        "phase": ["cuepass", "scenepass"],
+        "area": [],
+        "modulation": [],
+        "feedback": [],
+        "readout": ["flatten", "fc1", "logits"],
+        "totals": ["totals"],
+        "legend": ["legend"],
+    }
     lines.append(
-        f'    cue["Cue input<br/>[{input_channels}, {input_h}, {input_w}]<br/>visual cue image"]'
+        f'    cue["{_format_mermaid_node_label("Cue input", f"shape: {_format_feature_shape(input_channels, input_h, input_w)}", "role: visual cue image")}"]'
     )
     lines.append(
-        f'    scene["Scene input<br/>[{input_channels}, {input_h}, {input_w}]<br/>search image"]'
+        f'    scene["{_format_mermaid_node_label("Scene input", f"shape: {_format_feature_shape(input_channels, input_h, input_w)}", "role: search image")}"]'
     )
-    lines.append(f'    cuepass["Cue phase<br/>T = {model.num_steps} recurrent steps<br/>stores cue activations"]')
-    lines.append(f'    scenepass["Scene phase<br/>T = {model.num_steps} recurrent steps"]')
+    lines.append(
+        f'    cuepass["{_format_mermaid_node_label("Cue phase", f"steps: T = {model.num_steps} recurrent steps", "stores: cue activations")}"]'
+    )
+    lines.append(
+        f'    scenepass["{_format_mermaid_node_label("Scene phase", f"steps: T = {model.num_steps} recurrent steps")}"]'
+    )
 
     for i, layer in enumerate(model.layers):
         area = chr(ord("A") + i)
         state_h, state_w = model.input_sizes[i]
         out_h, out_w = model.output_sizes[i]
-        layer_params = _group_parameter_counts(
-            model,
-            (
-                f"layers.{i}.",
-                f"modulations.{i}.",
-                f"modulations_inter.{i}.",
-                f"pertubations.{i}.",
-                f"pertubations_inter.{i}.",
-            ),
+        layer_params = _group_parameter_counts(model, f"layers.{i}.")
+        fb_input = (
+            f"fb in: {_format_feature_shape(model.fb_dims[i], state_h, state_w)}"
+            if model.use_fb[i]
+            else None
         )
-        fb_in_params = 0
-        for name, param in model.named_parameters():
-            if name.startswith("fb_convs.") and name.split(".")[1].endswith(f"_{i}"):
-                fb_in_params += param.numel()
-        total_block_params = layer_params + fb_in_params
-        kernel_h, kernel_w = model.exc_kernel_sizes[i]
-        pad_h = kernel_h // 2
-        pad_w = kernel_w // 2
+        tau_line = (
+            f"tau pyr/inter: {layer.tau_pyr.numel()} / {layer.tau_inter.numel()}"
+            if layer.h_inter_dim > 0
+            else f"tau pyr: {layer.tau_pyr.numel()}"
+        )
+        ff_rc_fb_label = _format_ff_rc_fb_label(model.use_fb[i])
         lines.append(
-            f'    area{i}["Area {area}<br/>state E/I: {model.h_pyr_dims[i]}/{model.h_inter_dims[i]} @ {state_h}x{state_w}<br/>kernel: {kernel_h}x{kernel_w}, pad: {pad_h}/{pad_w}<br/>pooled out: [{model.h_pyr_dims[i]}, {out_h}, {out_w}]<br/>params: {total_block_params:,}"]'
+            f'    area{i}["{_format_mermaid_node_label(f"Area {area}", f"rc state pyr/inter: {model.h_pyr_dims[i]}/{model.h_inter_dims[i]} @ {state_h}x{state_w}", f"ff in: {_format_feature_shape(layer.input_dim, state_h, state_w)}", fb_input, f"ff pool out pyr: {_format_feature_shape(model.h_pyr_dims[i], out_h, out_w)}", f"{ff_rc_fb_label} conv to pyr: {_format_conv_train_dims(layer.conv_exc_pyr)}", f"{ff_rc_fb_label} conv to inter: {_format_conv_train_dims(layer.conv_exc_inter)}" if layer.h_inter_dim > 0 else None, f"rc conv inter->pyr: {_format_conv_train_dims(layer.conv_inh)}" if layer.h_inter_dim > 0 else None, f"bias: {_count_bias_parameters(layer):,}", tau_line, f"rc cell params: {layer_params:,}")}"]'
         )
+        class_nodes["area"].append(f"area{i}")
+
+        if getattr(model, "modulation", False):
+            mod_name = f"mod{i}"
+            if model.modulation_on == "hidden":
+                mod_module = model.modulations[i]
+                mod_params = sum(param.numel() for param in mod_module.parameters())
+                mod_inter_module = model.modulations_inter[i]
+                mod_inter_params = sum(
+                    param.numel() for param in mod_inter_module.parameters()
+                )
+                mod_inter_shape = (
+                    f"rc target inter: {_format_feature_shape(model.h_inter_dims[i], state_h, state_w)}"
+                    if model.h_inter_dims[i] > 0 and mod_inter_params > 0
+                    else None
+                )
+                mod_train_line = (
+                    f"fc h/w pyr: {mod_module.rank_one_vec_h.in_features} -> {mod_module.rank_one_vec_h.out_features}, {mod_module.rank_one_vec_w.in_features} -> {mod_module.rank_one_vec_w.out_features}"
+                )
+                mod_inter_train_line = (
+                    f"fc h/w inter: {mod_inter_module.rank_one_vec_h.in_features} -> {mod_inter_module.rank_one_vec_h.out_features}, {mod_inter_module.rank_one_vec_w.in_features} -> {mod_inter_module.rank_one_vec_w.out_features}"
+                    if mod_inter_shape is not None
+                    else None
+                )
+                mod_param_line = (
+                    f"params pyr/inter: {mod_params:,}/{mod_inter_params:,}"
+                    if mod_inter_shape is not None
+                    else f"params: {mod_params:,}"
+                )
+                mod_bias_line = (
+                    f"bias pyr/inter: {_count_bias_parameters(mod_module):,}/{_count_bias_parameters(mod_inter_module):,}"
+                    if mod_inter_shape is not None
+                    else f"bias: {_count_bias_parameters(mod_module):,}"
+                )
+                lines.append(
+                    f'    {mod_name}["{_format_mermaid_node_label(f"Mod {area}", "mode: hidden", f"pool cue pyr: {_format_feature_shape(model.h_pyr_dims[i], state_h, state_w)} -> [{model.h_pyr_dims[i]}]", f"pool cue inter: {_format_feature_shape(model.h_inter_dims[i], state_h, state_w)} -> [{model.h_inter_dims[i]}]" if mod_inter_shape is not None else None, f"rc target pyr: {_format_feature_shape(model.h_pyr_dims[i], state_h, state_w)}", mod_inter_shape, mod_train_line, mod_inter_train_line, mod_bias_line, mod_param_line)}"]'
+                )
+            else:
+                mod_module = model.modulations[i]
+                mod_params = sum(param.numel() for param in mod_module.parameters())
+                lines.append(
+                    f'    {mod_name}["{_format_mermaid_node_label(f"Mod {area}", "mode: layer_output", f"pool cue pyr: {_format_feature_shape(model.h_pyr_dims[i], out_h, out_w)} -> [{model.h_pyr_dims[i]}]", f"ff pool target pyr: {_format_feature_shape(model.h_pyr_dims[i], out_h, out_w)}", f"fc h/w pyr: {mod_module.rank_one_vec_h.in_features} -> {mod_module.rank_one_vec_h.out_features}, {mod_module.rank_one_vec_w.in_features} -> {mod_module.rank_one_vec_w.out_features}", f"bias: {_count_bias_parameters(mod_module):,}", f"params: {mod_params:,}")}"]'
+                )
+            class_nodes["modulation"].append(mod_name)
 
     flatten_dim = model.h_pyr_dims[-1] * prod(model.output_sizes[-1])
     hidden_linear = model.out_layer[1]
@@ -215,32 +420,98 @@ def format_mermaid_model_diagram(model):
     hidden_params = hidden_linear.weight.numel() + hidden_linear.bias.numel()
     final_params = final_linear.weight.numel() + final_linear.bias.numel()
 
-    lines.append(f'    flatten["Flatten<br/>{flatten_dim:,}"]')
+    lines.append(f'    flatten["{_format_mermaid_node_label("Flatten", f"{flatten_dim:,}")}"]')
     lines.append(
-        f'    fc1["FC hidden<br/>{flatten_dim:,} -> {hidden_linear.out_features}<br/>params: {hidden_params:,}"]'
+        f'    fc1["{_format_mermaid_node_label("ff fc hidden", f"ff fc: {flatten_dim:,} -> {hidden_linear.out_features}", f"bias: {hidden_linear.bias.numel():,}", f"params: {hidden_params:,}")}"]'
     )
     lines.append(
-        f'    logits["Logits<br/>{hidden_linear.out_features} -> {final_linear.out_features}<br/>params: {final_params:,}"]'
+        f'    logits["{_format_mermaid_node_label("ff fc Logits", f"ff fc: {hidden_linear.out_features} -> {final_linear.out_features}", f"bias: {final_linear.bias.numel():,}", f"params: {final_params:,}")}"]'
     )
     lines.append(
-        f'    totals["Totals<br/>backbone: {counts["backbone"]:,}<br/>readout: {counts["readout"]:,}<br/>total: {counts["total"]:,}"]'
+        f'    totals["{_format_mermaid_node_label("Totals", f"backbone: {counts["backbone"]:,}", f"readout: {counts["readout"]:,}", f"total: {counts["total"]:,}")}"]'
+    )
+    lines.append(
+        f'    legend["{_format_mermaid_node_label("Legend", "ff/fb/rc: feedforward / feedback / recurrent", "conv/fc/pool: operator subtype", "pyr/inter: pyramidal / interneuron", "numeric arrows: learned input -> output dims for conv/fc", "bias: learned bias scalars", "tau: learned per-channel time constants", "params / rc cell params: include listed bias and tau counts")}"]'
     )
 
     scene_chain = " --> ".join(["scenepass", *[f"area{i}" for i in range(len(model.layers))], "flatten", "fc1", "logits", "totals"])
     lines.append("    cue --> cuepass")
     lines.append("    scene --> scenepass")
     lines.append(f"    {scene_chain}")
-    for i in range(len(model.layers)):
-        lines.append(f"    cuepass -. cue-conditioned modulation .-> area{i}")
+
+    if getattr(model, "modulation", False):
+        for i in range(len(model.layers)):
+            lines.append(f"    cuepass -. cue-conditioned .-> mod{i}")
+            lines.append(f"    mod{i} -. applies .-> area{i}")
+
+    if getattr(model, "fb_adjacency", None) is not None and hasattr(model, "fb_convs"):
+        for source_i, targets in enumerate(model.fb_adjacency):
+            for target_i in targets:
+                fb_name = f"fb{source_i}_{target_i}"
+                source_h, source_w = model.output_sizes[source_i]
+                target_h, target_w = model.input_sizes[target_i]
+                fb_params = _group_parameter_counts(
+                    model, f"fb_convs.fb_conv_{source_i}_{target_i}."
+                )
+                source_area = chr(ord("A") + source_i)
+                target_area = chr(ord("A") + target_i)
+                lines.append(
+                    f'    {fb_name}["{_format_mermaid_node_label(f"fb {source_area} -> {target_area}", f"fb src pyr: {_format_feature_shape(model.h_pyr_dims[source_i], source_h, source_w)}", f"fb resize: {_format_feature_shape(model.h_pyr_dims[source_i], target_h, target_w)}", f"fb conv: 1x1 conv {model.h_pyr_dims[source_i]} -> {model.fb_dims[target_i]}", f"fb out: {_format_feature_shape(model.fb_dims[target_i], target_h, target_w)}", f"bias: {model.fb_convs[f'fb_conv_{source_i}_{target_i}'][1].bias.numel():,}", f"params: {fb_params:,}")}"]'
+                )
+                lines.append(f"    area{source_i} -. feedback emit .-> {fb_name}")
+                lines.append(f"    {fb_name} -. next step .-> area{target_i}")
+                class_nodes["feedback"].append(fb_name)
+
+    lines.append("    totals -. notation .-> legend")
+
+    lines.append(
+        "    classDef io fill:#e8f1ff,stroke:#2b6cb0,color:#0f172a,stroke-width:1.5px;"
+    )
+    lines.append(
+        "    classDef phase fill:#fff4d6,stroke:#b7791f,color:#5c3b00,stroke-width:1.5px;"
+    )
+    lines.append(
+        "    classDef area fill:#e8fbef,stroke:#2f855a,color:#123524,stroke-width:1.5px;"
+    )
+    lines.append(
+        "    classDef modulation fill:#fff1f2,stroke:#c53030,color:#63171b,stroke-width:1.5px;"
+    )
+    lines.append(
+        "    classDef feedback fill:#eef2ff,stroke:#4c51bf,color:#1a365d,stroke-width:1.5px,stroke-dasharray: 4 2;"
+    )
+    lines.append(
+        "    classDef readout fill:#f5f3ff,stroke:#6b46c1,color:#2d1b69,stroke-width:1.5px;"
+    )
+    lines.append(
+        "    classDef totals fill:#f3f4f6,stroke:#4b5563,color:#111827,stroke-width:1.5px;"
+    )
+    lines.append(
+        "    classDef legend fill:#fffaf0,stroke:#b7791f,color:#5b3a00,stroke-width:1.5px;"
+    )
+    _append_mermaid_class(lines, "io", class_nodes["io"])
+    _append_mermaid_class(lines, "phase", class_nodes["phase"])
+    _append_mermaid_class(lines, "area", class_nodes["area"])
+    _append_mermaid_class(lines, "modulation", class_nodes["modulation"])
+    _append_mermaid_class(lines, "feedback", class_nodes["feedback"])
+    _append_mermaid_class(lines, "readout", class_nodes["readout"])
+    _append_mermaid_class(lines, "totals", class_nodes["totals"])
+    _append_mermaid_class(lines, "legend", class_nodes["legend"])
     lines.append("```")
     return "\n".join(lines)
 
 
-def format_model_setup_report(model, include_mermaid=False, readout_prefix="out_layer"):
+def format_model_setup_report(
+    model,
+    include_mermaid=False,
+    readout_prefix="out_layer",
+    mermaid_layout="auto",
+):
     sections = [format_parameter_report(model, readout_prefix=readout_prefix)]
     if include_mermaid:
         sections.append("Model shape + parameter flow:")
-        sections.append(format_mermaid_model_diagram(model))
+        sections.append(
+            format_mermaid_model_diagram(model, layout=mermaid_layout)
+        )
     return "\n\n".join(sections)
 
 
@@ -263,18 +534,6 @@ def get_git_commit_hash(default="unknown"):
         return subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], text=True).strip()
     except (FileNotFoundError, subprocess.CalledProcessError):
         return default
-
-
-def resolve_model_output_mode(
-    show_model_diagram=False,
-    save_model_diagram_png=False,
-    output_model_structure_only=False,
-):
-    return {
-        "structure_only": output_model_structure_only,
-        "show_model_diagram": show_model_diagram or output_model_structure_only,
-        "save_model_diagram_png": save_model_diagram_png or output_model_structure_only,
-    }
 
 
 def _render_mermaid_with_mmdc(mermaid_report, output_path):
@@ -314,21 +573,45 @@ def save_mermaid_diagram(
     return output_path
 
 
-def save_mermaid_diagram_png(
+def save_mermaid_source(
+    mermaid_report,
+    output_dir=".",
+    when=None,
+    commit_hash="unknown",
+):
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / make_model_diagram_filename(
+        when=when,
+        commit_hash=commit_hash,
+        output_format="mmd",
+    )
+    output_path.write_text(_extract_mermaid_body(mermaid_report), encoding="utf-8")
+    return output_path
+
+
+def export_mermaid_diagram_assets(
     mermaid_report,
     output_dir=".",
     when=None,
     commit_hash="unknown",
     renderer=None,
 ):
-    return save_mermaid_diagram(
+    source_path = save_mermaid_source(
         mermaid_report,
         output_dir=output_dir,
         when=when,
         commit_hash=commit_hash,
-        output_format="png",
+    )
+    pdf_path = save_mermaid_diagram(
+        mermaid_report,
+        output_dir=output_dir,
+        when=when,
+        commit_hash=commit_hash,
+        output_format="pdf",
         renderer=renderer,
     )
+    return {"source_path": source_path, "pdf_path": pdf_path}
 
 
 def profile_fn(fn, kwargs, sort_by="cuda_time_total", row_limit=50):

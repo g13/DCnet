@@ -135,8 +135,6 @@ checkpoint:
 seed: 42
 tqdm: True
 wandb: False
-show_model_diagram: True
-save_model_diagram_png: True
 model_diagram_output_dir: .
 output_model_structure_only: True
 

@@ -14,11 +14,10 @@ from data import get_qclevr_dataloaders
 from model import Conv2dEIRNN
 from utils import (
     AttrDict,
+    export_mermaid_diagram_assets,
     format_mermaid_model_diagram,
     format_model_setup_report,
     get_git_commit_hash,
-    resolve_model_output_mode,
-    save_mermaid_diagram,
     seed,
 )
 import numpy as np
@@ -259,31 +258,23 @@ def train(config: DictConfig) -> None:
     torch.set_float32_matmul_precision(config.train.matmul_precision)
     # Get device and initialize the model
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    output_mode = resolve_model_output_mode(
-        show_model_diagram=config.get("show_model_diagram", False),
-        save_model_diagram_png=config.get("save_model_diagram_png", False),
-        output_model_structure_only=config.get("output_model_structure_only", False),
-    )
     # The main training path always imports `Conv2dEIRNN` from model.py. `model_fig4.py`
     # is an auxiliary Figure 4 reproduction attempt and is not used here by default.
     model = Conv2dEIRNN(**config.model).to(device)
-    print(
-        format_model_setup_report(
-            model,
-            include_mermaid=output_mode["show_model_diagram"],
+    print(format_model_setup_report(model, include_mermaid=False))
+    try:
+        diagram_outputs = export_mermaid_diagram_assets(
+            format_mermaid_model_diagram(model),
+            output_dir=config.get("model_diagram_output_dir", "."),
+            commit_hash=get_git_commit_hash(default="unknown"),
         )
-    )
-    if output_mode["save_model_diagram_png"]:
-        try:
-            output_path = save_mermaid_diagram(
-                format_mermaid_model_diagram(model),
-                output_dir=config.get("model_diagram_output_dir", "."),
-                commit_hash=get_git_commit_hash(default="unknown"),
-            )
-            print(f"Saved model diagram to: {output_path}")
-        except Exception as exc:
-            print(f"Warning: could not save model diagram: {exc}")
-    if output_mode["structure_only"]:
+        print(
+            "Saved model diagram files to: "
+            f"{diagram_outputs['source_path']}, {diagram_outputs['pdf_path']}"
+        )
+    except Exception as exc:
+        print(f"Warning: could not export model diagram files: {exc}")
+    if config.get("output_model_structure_only", False):
         print("Model structure only mode enabled; skipping compile, data loading, and training.")
         return
 
