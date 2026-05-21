@@ -9,8 +9,8 @@ model:
   # Layer widths for sensory areas A-D. Per-layer states use shapes
   # h_pyr[l]: [B, h_pyr_dim[l], H_l, W_l] and h_inter[l]: [B, h_inter_dim[l], H_l, W_l].
   # Appendix A.2 of the paper is closer to the current widths here: [16, 32, 64, 128]
-  # for pyramidal cells and [4, 8, 16, 32] for interneurons. The remaining tension is
-  # that these widths do not line up cleanly with the paper's separate ~1.8M parameter claim.
+  # for pyramidal cells and [4, 8, 16, 32] for interneurons. With fc_dim=128 below,
+  # these widths land near the paper's separate ~1.8M parameter claim.
   h_pyr_dim: [16, 32, 64, 128]
   h_inter_dim: [4, 8, 16, 32]
   fb_dim: [16, 32, 64, 64]
@@ -30,8 +30,8 @@ model:
   immediate_inhibition: True
   num_layers: 4
   # The repo's DCnet uses 5 cue steps and 5 scene steps. Appendix B explicitly states T=3 for
-  # the Convolutional RNN baseline; the paper is less explicit about DCnet's T, so this remains
-  # a text-vs-code ambiguity rather than a clean match.
+  # the Convolutional RNN baseline, but the paper does not pin down DCnet's T numerically.
+  # Keep 5 for the closest repo-faithful DCnet reproduction unless running a T ablation.
   num_steps: 5
   num_classes: 6
 
@@ -52,9 +52,9 @@ model:
   layer_time_delay: False
   exc_rectify: Null
   inh_rectify: pos
-  # When True, the recurrent state is reset before the scene phase. Cue information still
-  # reaches the scene phase through stored cue activations used by the modulation path.
-  flush_hidden: True
+  # Keep recurrent state continuous from cue to scene for the paper's single T+T trial timeline.
+  # Cue information also reaches the scene phase through stored cue activations used by modulation.
+  flush_hidden: False
   hidden_init_mode: zeros
   fb_init_mode: zeros
   out_init_mode: zeros
@@ -69,37 +69,33 @@ model:
   dropout: 0.5
   pre_inh_activation: tanh
   post_inh_activation: Null
-  fc_dim: 256
+  fc_dim: 128
 # Training parameters
 data:
-  #root: /scratch/wyy/data/color_balanced
-  root: /scratch/wyy/data/color_less
+  root: /scratch/wd/DCnet/data/qclevr_shared/
   assets_path: data/CLEVR_v1.0/cues
-  #batch_size: 256
-  # Paper/original setup used 256. The current training loop does not implement
-  # gradient accumulation, so this value is the true optimizer batch size.
+  # Paper setup used batches of 256 samples. Use two 128-sample microbatches to reduce A40 memory.
   batch_size: 128
-  val_batch_size: 64
+  val_batch_size: 128
   #holdout: [blue, green]
-  # Empty holdout disables the cue-holdout generalization split discussed in the paper.
+  # Empty holdout gives the main novel-scene validation setup. Novel-cue generalization should be
+  # run separately with a holdout list that covers each active mode's exact cue strings.
   holdout: []
   # `color`, `shape`, and `conjunction` are all supported by the dataset code.
-  # This active config only trains/evals color trials.
-  mode: color
+  # `every` trains/evals the combined vis-count task across all three trial types.
+  mode: every
   primitive: True
   num_workers: 8
 optimizer: 
   fn: adamw
-  #lr: 0.0004
-  # The paper appendix reports AdamW with max lr 4e-4. The current value is larger.
-  lr: 0.001
+  # The paper appendix reports AdamW with max lr 4e-4.
+  lr: 0.0004
   momentum: 0.9
   beta1: 0.9
   beta2: 0.999
 scheduler:
   fn: one_cycle
-  # `pct_start` matches the paper appendix numerically, but train.py currently relies on
-  # the library default instead of passing this config value explicitly.
+  # `pct_start=0.3` matches the paper's 30-epoch warmup over 100 epochs.
   pct_start: 0.3
 criterion: 
   fn: ce
@@ -111,19 +107,22 @@ compile:
   backend: inductor
   mode: reduce-overhead
 train:
-  amp: true  # 启用混合精度
-  # This knob is not consumed by train.py yet, so it does not emulate a larger batch.
-  accumulation_steps: 4  # 梯度累积步数
+  # AMP reduces activation memory and speeds up CUDA training; disable for exact FP32 comparisons.
+  amp: true
+  # Effective training batch is batch_size * accumulation_steps = 256, matching the paper.
+  accumulation_steps: 2
   empty_cache_freq: 100  
 
   matmul_precision: high
   #epochs: 150
   epochs: 100
   log_freq: 5
+  # Set this true for stdout batch progress in nohup/log-file runs. Use `train.log_freq=1`
+  # for every batch; with the current dataset/batch size that is 3000 lines per epoch.
+  print_batch_progress: false
   grad_clip:
-    #disable: True
-    # The original config disabled clipping; enabling it changes optimizer behavior.
-    disable: False
+    # The paper does not report clipping; keep it disabled for paper-faithful optimization.
+    disable: True
     type: norm
     value: 1.0
 checkpoint:
@@ -136,6 +135,6 @@ seed: 42
 tqdm: True
 wandb: False
 model_diagram_output_dir: .
-output_model_structure_only: True
+output_model_structure_only: False
 
 verbose: True  # 控制是否打印详细日志

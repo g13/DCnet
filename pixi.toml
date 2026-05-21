@@ -22,3 +22,7 @@ tqdm = ">=4.67.3,<5"
 matplotlib = ">=3.10.9,<4"
 pyyaml = ">=6.0.3,<7"
 nodejs = ">=25.8.2,<25.9"
+pytorch-gpu = ">=2.10.0,<3"
+
+[system-requirements]
+cuda = "13.0"

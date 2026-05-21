@@ -2,6 +2,9 @@ data
 .*
 __pycache__/
 outputs/
+checkpoints*/
+flow_chart-*.mmd
+flow_chart-*.pdf
 # pixi environments
 .pixi/*
 !.pixi/config.toml
